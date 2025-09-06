@@ -1,380 +1,785 @@
+"""
+render_farm_gui_with_eta.py
+Server + Client GUI (Artist & Worker) dengan:
+- parsing progress & ETA dari log blender
+- UI multiple workers + pilih worker manual saat submit
+
+Requirements:
+pip install Flask PySide6 requests
+"""
+
+import sys
 import os
+import threading
+import time
+import uuid
 import subprocess
 import json
-import time
-import datetime
-import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from tkinterdnd2 import DND_FILES, TkinterDnD
-import ttkbootstrap as tb
-from ttkbootstrap.constants import *
+import re
+from datetime import datetime
+from functools import partial
 
-# ==============================
-# Inspect .blend
-# ==============================
-def inspect_blend(blend_file, blender_exec="blender"):
-    code = """
-import bpy, json
-scene = bpy.context.scene
-data = {
-    "frame_start": scene.frame_start,
-    "frame_end": scene.frame_end,
-    "frame_step": scene.frame_step,
-    "output_path": scene.render.filepath,
-    "use_nodes": scene.use_nodes
-}
-print("BLEND_META_START")
-print(json.dumps(data))
-print("BLEND_META_END")
+# --------- CONFIG ----------
+SERVER_HOST = "0.0.0.0"
+SERVER_PORT = 5000
+SERVER_URL = f"http://127.0.0.1:{SERVER_PORT}"  # jika ingin jaringan, ganti ke IP server
+POLL_INTERVAL = 1.0  # detik polling GUI
+FRAME_TIME_WINDOW = 8  # number of recent frames to average
+# ---------------------------
+
+# ---- Backend (Flask) ----
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+# In-memory store (simple)
+WORKERS = {}  # worker_id -> {id, name, on, last_seen, info}
+TASKS = {}    # task_id -> {id, path, start, end, artist, status, assigned_worker, logs[], created_at, updated_at, progress...}
+
+LOCK = threading.Lock()
+
+def now_iso():
+    return datetime.utcnow().isoformat() + "Z"
+
+@app.route("/register_worker", methods=["POST"])
+def register_worker():
+    payload = request.json
+    wid = payload.get("id")
+    with LOCK:
+        WORKERS[wid] = {
+            "id": wid,
+            "name": payload.get("name", "worker"),
+            "on": payload.get("on", True),
+            "info": payload.get("info", {}),
+            "last_seen": now_iso()
+        }
+    return jsonify({"ok": True})
+
+@app.route("/update_worker", methods=["POST"])
+def update_worker():
+    payload = request.json
+    wid = payload.get("id")
+    with LOCK:
+        if wid in WORKERS:
+            WORKERS[wid]["on"] = payload.get("on", WORKERS[wid]["on"])
+            WORKERS[wid]["info"] = payload.get("info", WORKERS[wid]["info"])
+            # allow name update
+            if payload.get("name"):
+                WORKERS[wid]["name"] = payload.get("name")
+            WORKERS[wid]["last_seen"] = now_iso()
+            return jsonify({"ok": True})
+        else:
+            return jsonify({"ok": False, "error": "unknown worker"}), 404
+
+@app.route("/list_workers", methods=["GET"])
+def list_workers():
+    with LOCK:
+        return jsonify({"workers": list(WORKERS.values())})
+
+@app.route("/submit_task", methods=["POST"])
+def submit_task():
+    payload = request.json
+    path = payload.get("path")
+    start = int(payload.get("start", 1))
+    end = int(payload.get("end", start))
+    artist = payload.get("artist", "unknown")
+    assigned = payload.get("assigned_worker")  # can be None or worker id or 'auto'
+    with LOCK:
+        task_id = str(uuid.uuid4())
+        # if explicitly requested assigned worker but that worker is OFF -> still accept but mark assigned_worker as given (worker won't accept until on)
+        assigned_worker = None
+        if assigned and assigned != "auto":
+            # if that worker exists, keep assigned (even if off)
+            if assigned in WORKERS:
+                assigned_worker = assigned
+            else:
+                assigned_worker = None
+        else:
+            # auto: pick first ON worker
+            for w in WORKERS.values():
+                if w.get("on"):
+                    assigned_worker = w["id"]
+                    break
+        TASKS[task_id] = {
+            "id": task_id,
+            "path": path,
+            "start": start,
+            "end": end,
+            "artist": artist,
+            "status": "queued",
+            "assigned_worker": assigned_worker,
+            "logs": [],
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            # progress fields
+            "current_frame": None,
+            "total_frames": end - start + 1,
+            "progress_percent": 0.0,
+            "eta_seconds": None
+        }
+    return jsonify({"ok": True, "task_id": task_id, "assigned_worker": assigned_worker})
+
+@app.route("/get_task", methods=["GET"])
+def get_task():
+    wid = request.args.get("worker_id")
+    with LOCK:
+        # Prefer tasks explicitly assigned to this worker first
+        for t in TASKS.values():
+            if t["status"] == "queued" and (t["assigned_worker"] == wid):
+                t["status"] = "assigned"
+                t["assigned_worker"] = wid
+                t["updated_at"] = now_iso()
+                return jsonify({"task": t})
+        # Otherwise, give first queued unassigned or assigned to None
+        for t in TASKS.values():
+            if t["status"] == "queued" and (t["assigned_worker"] is None):
+                # ensure this worker is ON (caller should be a worker that is on)
+                t["assigned_worker"] = wid
+                t["status"] = "assigned"
+                t["updated_at"] = now_iso()
+                return jsonify({"task": t})
+    return jsonify({"task": None})
+
+@app.route("/update_task", methods=["POST"])
+def update_task():
+    payload = request.json
+    tid = payload.get("task_id")
+    status = payload.get("status")
+    log = payload.get("log")
+    extra = payload.get("extra", {})  # can contain progress fields
+    with LOCK:
+        if tid not in TASKS:
+            return jsonify({"ok": False, "error": "unknown task"}), 404
+        t = TASKS[tid]
+        if status:
+            t["status"] = status
+        if log:
+            t["logs"].append({"t": now_iso(), "line": log})
+            if len(t["logs"]) > 5000:
+                t["logs"] = t["logs"][-5000:]
+        # update progress fields if present
+        if extra:
+            if "current_frame" in extra:
+                t["current_frame"] = extra["current_frame"]
+            if "total_frames" in extra:
+                t["total_frames"] = extra["total_frames"]
+            if "progress_percent" in extra:
+                t["progress_percent"] = extra["progress_percent"]
+            if "eta_seconds" in extra:
+                t["eta_seconds"] = extra["eta_seconds"]
+        t["updated_at"] = now_iso()
+    return jsonify({"ok": True})
+
+@app.route("/tasks", methods=["GET"])
+def tasks():
+    with LOCK:
+        return jsonify({"tasks": list(TASKS.values())})
+
+def run_server():
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+
+# ---- CLIENT GUI (PySide6) ----
+from PySide6 import QtCore, QtWidgets, QtGui
+import requests
+
+# --------- Stylesheet dark modern ----------
+DARK_STYLE = """
+QWidget { background: #0f1115; color: #e6eef3; font-family: "Segoe UI", Roboto, Arial; }
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox { background: #111216; border: 1px solid #22262b; padding: 6px; border-radius: 6px; }
+QPushButton { background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #2c6fdb, stop:1 #1b5ed7); border-radius: 8px; padding: 8px; color: white; font-weight:600; }
+QPushButton:disabled { background: #3a3f45; color: #999; }
+QLabel#title { font-size:18px; font-weight:700; }
+QGroupBox { border: 1px solid #1a1d22; border-radius:8px; margin-top:8px; padding:10px; }
+QScrollArea { background: transparent; }
+QCheckBox { padding:4px; }
+QComboBox { padding:6px; border-radius:6px; }
+QTableWidget { background: #0f1115; gridline-color: #222; }
+QHeaderView::section { background: #0f1115; color: #bfcbd8; padding:6px; }
+QProgressBar { background: #111216; border-radius:6px; height:12px; }
+#small { font-size:11px; color:#9fb3c8; }
+.toggle-btn { background: #2b2f34; border-radius:18px; padding:4px; min-width:64px; min-height:28px; color:#cfe9ff; }
 """
+
+# --------- Utility functions ----------
+def api_post(path, data):
     try:
-        result = subprocess.run(
-            [blender_exec, "-b", blend_file, "--python-expr", code],
-            capture_output=True, text=True
-        )
-        inside = False
-        json_str = ""
-        for line in result.stdout.splitlines():
-            if "BLEND_META_START" in line:
-                inside = True
-                continue
-            if "BLEND_META_END" in line:
-                break
-            if inside:
-                json_str += line.strip()
-        if json_str:
-            return json.loads(json_str)
+        r = requests.post(SERVER_URL + path, json=data, timeout=4)
+        return r.json()
     except Exception as e:
-        print("Inspect error:", e)
-    return None
+        return {"ok": False, "error": str(e)}
 
-# ==============================
-# Render job
-# ==============================
-def render_job(blend_file, start, end, step, blender_exec="blender", update_frame_cb=None):
-    cmd = [
-        blender_exec, "-b", blend_file,
-        "-s", str(start),
-        "-e", str(end),
-        "-j", str(step),
-        "-a"
-    ]
-    print("Running:", " ".join(cmd))
+def api_get(path, params=None):
+    try:
+        r = requests.get(SERVER_URL + path, params=params, timeout=4)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in process.stdout:
-        if "Fra:" in line:
+def format_eta(seconds):
+    if seconds is None:
+        return "-"
+    try:
+        s = int(round(float(seconds)))
+    except:
+        return "-"
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h{m:02d}m"
+    if m > 0:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+# --------- Worker Logic with ETA parsing ----------
+class WorkerThread(QtCore.QThread):
+    log_signal = QtCore.Signal(str)
+    status_signal = QtCore.Signal(str)
+    progress_signal = QtCore.Signal(dict)  # {percent, current, total, eta}
+
+    def __init__(self, worker_id, worker_name, parent=None):
+        super().__init__(parent)
+        self.worker_id = worker_id
+        self.worker_name = worker_name
+        self._running = True
+        self._available = True
+        # internal for ETA parsing
+        self._frame_times = []  # list of durations between consecutive frames (seconds)
+        self._last_frame_time = None
+        self._last_frame_number = None
+        # regex patterns to detect frame lines
+        # common patterns: "Fra: 1 Mem:", "Fra:1", "Saved: /.../frame_0001.png"
+        self.re_frame = re.compile(r"\bFra[:\s]+(\d+)\b", re.IGNORECASE)
+        self.re_frame_alt = re.compile(r"\bFrame[:\s]+(\d+)\b", re.IGNORECASE)
+        self.re_saved = re.compile(r"Saved:.*?(\d+)(?:\D|$)")  # sometimes includes frame number
+        self.re_rendered = re.compile(r"Finished rendering.*?(\d+)", re.IGNORECASE)
+
+    def set_available(self, avail: bool):
+        self._available = avail
+        api_post("/update_worker", {"id": self.worker_id, "on": avail, "name": self.worker_name, "info": {}})
+
+    def stop(self):
+        self._running = False
+
+    def _extract_frame_from_line(self, line: str):
+        # try multiple regexes
+        m = self.re_frame.search(line)
+        if m:
             try:
-                frame_num = int(line.split("Fra:")[1].split()[0])
-                if update_frame_cb:
-                    update_frame_cb(frame_num)
+                return int(m.group(1))
             except:
                 pass
-    process.wait()
-    return process.returncode
+        m = self.re_frame_alt.search(line)
+        if m:
+            try:
+                return int(m.group(1))
+            except:
+                pass
+        m = self.re_saved.search(line)
+        if m:
+            try:
+                return int(m.group(1))
+            except:
+                pass
+        m = self.re_rendered.search(line)
+        if m:
+            try:
+                return int(m.group(1))
+            except:
+                pass
+        # fallback: try to find standalone integers that look like frames when context includes "Time" or "Fra"
+        return None
 
-# ==============================
-# Main App
-# ==============================
-class BlenderQueueApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("🎬 RenderQ by Dwiky")
-        self.root.geometry("1000x720")
+    def run(self):
+        # register initially
+        api_post("/register_worker", {"id": self.worker_id, "name": self.worker_name, "on": self._available, "info": {}})
+        self.log_signal.emit(f"[{now_iso()}] Worker registered: {self.worker_name} ({self.worker_id})")
+        while self._running:
+            try:
+                # heartbeat update
+                api_post("/update_worker", {"id": self.worker_id, "on": self._available, "name": self.worker_name, "info": {}})
+                if self._available:
+                    res = api_get("/get_task", params={"worker_id": self.worker_id})
+                    if isinstance(res, dict) and res.get("task"):
+                        t = res["task"]
+                        tid = t["id"]
+                        total_frames = t.get("total_frames", t.get("end", t.get("end", t["end"])) - t.get("start", t["start"]) + 1)
+                        cmd = [
+                            "blender", "-b", t["path"],
+                            "-s", str(t["start"]), "-e", str(t["end"]), "-a"
+                        ]
+                        api_post("/update_task", {"task_id": tid, "status": "running", "log": f"Worker {self.worker_name} started task."})
+                        self.status_signal.emit("running")
+                        self.log_signal.emit(f"Starting task {tid}: {' '.join(cmd)}")
+                        # reset ETA state
+                        self._frame_times = []
+                        self._last_frame_time = None
+                        self._last_frame_number = None
+                        # run subprocess and stream logs
+                        try:
+                            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                        except Exception as e:
+                            api_post("/update_task", {"task_id": tid, "status": "error", "log": f"Failed to start blender: {e}"})
+                            self.log_signal.emit(f"Failed to start blender: {e}")
+                            continue
+                        # read stdout line by line
+                        start_time = time.time()
+                        frames_seen = set()
+                        while True:
+                            line = proc.stdout.readline()
+                            if not line:
+                                if proc.poll() is not None:
+                                    break
+                                time.sleep(0.05)
+                                continue
+                            line_stripped = line.rstrip()
+                            # send raw log line to server
+                            api_post("/update_task", {"task_id": tid, "log": line_stripped})
+                            self.log_signal.emit(line_stripped)
+                            # attempt to parse a frame number
+                            frame_num = self._extract_frame_from_line(line_stripped)
+                            if frame_num is not None:
+                                now_t = time.time()
+                                # update frame times and compute average
+                                if self._last_frame_number is not None and frame_num != self._last_frame_number:
+                                    # accept only forward increments (or any change) but compute delta
+                                    if self._last_frame_time is not None:
+                                        delta = max(0.0001, now_t - self._last_frame_time)
+                                        self._frame_times.append(delta)
+                                        if len(self._frame_times) > FRAME_TIME_WINDOW:
+                                            self._frame_times.pop(0)
+                                self._last_frame_time = now_t
+                                self._last_frame_number = frame_num
+                                frames_seen.add(frame_num)
+                                # compute average frame time
+                                if len(self._frame_times) > 0:
+                                    avg = sum(self._frame_times) / len(self._frame_times)
+                                else:
+                                    # fallback: use elapsed / frames_seen
+                                    elapsed = now_t - start_time
+                                    if len(frames_seen) > 0:
+                                        avg = elapsed / max(1, len(frames_seen))
+                                    else:
+                                        avg = None
+                                # calculate progress & ETA
+                                start_frame = t.get("start", 1)
+                                end_frame = t.get("end", t.get("end", start_frame))
+                                total = end_frame - start_frame + 1
+                                # derive completed frames as max seen - start +1 clipped
+                                completed = max(0, frame_num - start_frame + 1)
+                                percent = min(100.0, (completed / total) * 100.0) if total > 0 else 0.0
+                                eta_s = None
+                                if avg is not None:
+                                    remaining = max(0, total - completed)
+                                    eta_s = remaining * avg
+                                # push progress update
+                                api_post("/update_task", {"task_id": tid, "extra": {
+                                    "current_frame": frame_num,
+                                    "total_frames": total,
+                                    "progress_percent": round(percent, 2),
+                                    "eta_seconds": int(round(eta_s)) if eta_s is not None else None
+                                }})
+                                # also emit locally
+                                self.progress_signal.emit({
+                                    "current_frame": frame_num,
+                                    "total_frames": total,
+                                    "percent": round(percent,2),
+                                    "eta_seconds": int(round(eta_s)) if eta_s is not None else None
+                                })
+                        ret = proc.poll()
+                        if ret == 0:
+                            api_post("/update_task", {"task_id": tid, "status": "done", "log": f"Worker finished: exit {ret}"})
+                            self.log_signal.emit(f"Task {tid} finished (exit {ret})")
+                        else:
+                            api_post("/update_task", {"task_id": tid, "status": "error", "log": f"Worker finished with error: exit {ret}"})
+                            self.log_signal.emit(f"Task {tid} finished with error (exit {ret})")
+                        self.status_signal.emit("idle")
+                    else:
+                        time.sleep(0.8)
+                else:
+                    time.sleep(1.0)
+            except Exception as e:
+                self.log_signal.emit(f"Worker loop error: {e}")
+                time.sleep(2.0)
 
-        self.queue = []  # list of dict: {file, meta, status}
-        self.is_rendering = False
-        self.blender_exec = "blender"
+# --------- GUI Components ----------
+class ToggleSwitch(QtWidgets.QPushButton):
+    def __init__(self, label_on="ON", label_off="OFF"):
+        super().__init__()
+        self.setCheckable(True)
+        self.setChecked(True)
+        self.setText(label_on)
+        self.label_on = label_on
+        self.label_off = label_off
+        self.setObjectName("toggle")
+        self.toggled.connect(self._on_toggle)
+        self.setStyleSheet("QPushButton#toggle { min-width:80px; padding:6px; border-radius:16px; }")
 
-        self.setup_ui()
+    def _on_toggle(self, checked):
+        self.setText(self.label_on if checked else self.label_off)
 
-    def setup_ui(self):
-        style = tb.Style("darkly")
+# Artist window with worker selection and ETA display
+class ArtistWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RenderQ - Submit")
+        self.setMinimumSize(980, 620)
+        self.init_ui()
+        self.poll_timer = QtCore.QTimer()
+        self.poll_timer.timeout.connect(self.refresh_all)
+        self.poll_timer.start(int(POLL_INTERVAL * 1000))
+        self.refresh_all()
 
-        # Queue list
-        frame_top = tb.LabelFrame(self.root, text="Render Queue")
-        frame_top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    def init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel("Artist - Submit Render Task")
+        header.setObjectName("title")
+        layout.addWidget(header)
 
-        self.file_list = tk.Listbox(frame_top, bg="#222", fg="white", selectbackground="#555", height=10)
-        self.file_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        main_h = QtWidgets.QHBoxLayout()
+        left_v = QtWidgets.QVBoxLayout()
+        right_v = QtWidgets.QVBoxLayout()
+        main_h.addLayout(left_v, 2)
+        main_h.addLayout(right_v, 3)
 
-        self.file_list.drop_target_register(DND_FILES)
-        self.file_list.dnd_bind("<<Drop>>", self.drop_file)
+        # --- left: form ---
+        form = QtWidgets.QGroupBox("Submit Task")
+        f_layout = QtWidgets.QGridLayout()
+        form.setLayout(f_layout)
 
-        scrollbar = tk.Scrollbar(frame_top)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_list.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.file_list.yview)
+        f_layout.addWidget(QtWidgets.QLabel("Your name:"), 0, 0)
+        self.input_name = QtWidgets.QLineEdit()
+        f_layout.addWidget(self.input_name, 0, 1)
 
-        # Buttons
-        frame_btn = tb.Frame(self.root)
-        frame_btn.pack(pady=5)
-        tb.Button(frame_btn, text="➕ Add Blend", bootstyle=PRIMARY, command=self.add_blend).pack(side=tk.LEFT, padx=5)
-        tb.Button(frame_btn, text="🗑 Remove by ID", bootstyle=DANGER, command=self.remove_by_id).pack(side=tk.LEFT, padx=5)
-        tb.Button(frame_btn, text="🔄 Retry by ID", bootstyle=WARNING, command=self.retry_by_id).pack(side=tk.LEFT, padx=5)
-        tb.Button(frame_btn, text="🔍 Inspect", bootstyle=INFO, command=self.inspect_selected).pack(side=tk.LEFT, padx=5)
+        f_layout.addWidget(QtWidgets.QLabel("Blend file path:"), 1, 0)
+        path_h = QtWidgets.QHBoxLayout()
+        self.input_path = QtWidgets.QLineEdit()
+        btn_browse = QtWidgets.QPushButton("Browse")
+        btn_browse.clicked.connect(self.browse_file)
+        path_h.addWidget(self.input_path)
+        path_h.addWidget(btn_browse)
+        f_layout.addLayout(path_h, 1, 1)
 
-        # Render Settings
-        frame_settings = tb.LabelFrame(self.root, text="Render Settings")
-        frame_settings.pack(fill=tk.X, padx=10, pady=10)
+        f_layout.addWidget(QtWidgets.QLabel("Start frame:"), 2, 0)
+        self.input_start = QtWidgets.QSpinBox()
+        self.input_start.setRange(0, 100000)
+        self.input_start.setValue(1)
+        f_layout.addWidget(self.input_start, 2, 1)
 
-        tb.Label(frame_settings, text="Start Frame:").grid(row=0, column=0, sticky="e")
-        self.start_entry = tb.Entry(frame_settings, width=10)
-        self.start_entry.grid(row=0, column=1, sticky="w", padx=5)
+        f_layout.addWidget(QtWidgets.QLabel("End frame:"), 3, 0)
+        self.input_end = QtWidgets.QSpinBox()
+        self.input_end.setRange(0, 100000)
+        self.input_end.setValue(1)
+        f_layout.addWidget(self.input_end, 3, 1)
 
-        tb.Label(frame_settings, text="End Frame:").grid(row=0, column=2, sticky="e")
-        self.end_entry = tb.Entry(frame_settings, width=10)
-        self.end_entry.grid(row=0, column=3, sticky="w", padx=5)
+        # worker selection
+        f_layout.addWidget(QtWidgets.QLabel("Assign to worker:"), 4, 0)
+        self.worker_combo = QtWidgets.QComboBox()
+        self.worker_combo.addItem("Auto (first ON)", "auto")
+        f_layout.addWidget(self.worker_combo, 4, 1)
 
-        tb.Label(frame_settings, text="Step:").grid(row=0, column=4, sticky="e")
-        self.step_entry = tb.Entry(frame_settings, width=10)
-        self.step_entry.grid(row=0, column=5, sticky="w", padx=5)
+        self.btn_submit = QtWidgets.QPushButton("Submit Task")
+        self.btn_submit.clicked.connect(self.submit_task)
+        f_layout.addWidget(self.btn_submit, 5, 0, 1, 2)
 
-        self.use_nodes_var = tk.BooleanVar()
-        self.use_nodes_check = tb.Checkbutton(
-            frame_settings, text="Use Nodes",
-            variable=self.use_nodes_var, bootstyle="round-toggle"
-        )
-        self.use_nodes_check.grid(row=0, column=6, padx=10)
+        left_v.addWidget(form)
 
-        # Inspect Output
-        frame_meta = tb.LabelFrame(self.root, text="Inspect Output & Metadata")
-        frame_meta.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.meta_text = tk.Text(frame_meta, bg="#111", fg="lightgreen", height=8)
-        self.meta_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # workers list panel
+        workers_box = QtWidgets.QGroupBox("Workers (live)")
+        w_layout = QtWidgets.QVBoxLayout()
+        workers_box.setLayout(w_layout)
+        self.workers_table = QtWidgets.QTableWidget(0, 4)
+        self.workers_table.setHorizontalHeaderLabels(["ID", "Name", "On", "Last seen"])
+        self.workers_table.horizontalHeader().setStretchLastSection(True)
+        w_layout.addWidget(self.workers_table)
+        left_v.addWidget(workers_box)
 
-        # Render Controls
-        frame_ctrl = tb.Frame(self.root)
-        frame_ctrl.pack(pady=10)
-        tb.Button(frame_ctrl, text="▶ Start Queue", bootstyle=SUCCESS, command=self.start_queue).pack(side=tk.LEFT, padx=5)
-        tb.Button(frame_ctrl, text="⏹ Stop Queue", bootstyle=SECONDARY, command=self.stop_queue).pack(side=tk.LEFT, padx=5)
+        # footer
+        footer = QtWidgets.QLabel("Created by Dwiky Gilang Imrodhani | https://github.com/dwikygilang")
+        footer.setObjectName("small")
+        left_v.addWidget(footer)
 
-        # Progress & ETA
-        self.progress = tb.Progressbar(self.root, bootstyle=SUCCESS, length=500)
-        self.progress.pack(pady=5)
-        self.eta_label = tb.Label(self.root, text="ETA job: --s | Total ETA: --s")
-        self.eta_label.pack()
+        # --- right: tasks + log ---
+        tasks_box = QtWidgets.QGroupBox("Tasks")
+        t_layout = QtWidgets.QVBoxLayout()
+        tasks_box.setLayout(t_layout)
 
-        # Status
-        self.status_label = tb.Label(self.root, text="Status: Idle")
-        self.status_label.pack(fill=tk.X, padx=10, pady=5)
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["ID", "Artist", "Frames", "Worker", "Status", "Progress", "ETA"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        t_layout.addWidget(self.table)
 
-        # Footer
-        footer = tb.Label(self.root,
-                          text="Made by Dwiky Gilang Imrodhani  |  https://github.com/dwikygilang",
-                          bootstyle="secondary")
-        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
+        log_box = QtWidgets.QGroupBox("Selected Task Log & Details")
+        lg_layout = QtWidgets.QVBoxLayout()
+        log_box.setLayout(lg_layout)
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        lg_layout.addWidget(self.log_view)
+        self.task_detail_label = QtWidgets.QLabel("")
+        self.task_detail_label.setObjectName("small")
+        lg_layout.addWidget(self.task_detail_label)
 
-    # ==============================
-    # Drag & Drop
-    # ==============================
-    def drop_file(self, event):
-        files = self.root.splitlist(event.data)
-        for f in files:
-            if f.endswith(".blend"):
-                self.queue.append({"file": f, "meta": None, "status": "Pending"})
-        self.refresh_list()
+        right_v.addWidget(tasks_box)
+        right_v.addWidget(log_box)
 
-    # ==============================
-    # Queue Functions
-    # ==============================
-    def add_blend(self):
-        file = filedialog.askopenfilename(filetypes=[("Blender Files", "*.blend")])
-        if file:
-            self.queue.append({"file": file, "meta": None, "status": "Pending"})
-            self.refresh_list()
+        layout.addLayout(main_h)
 
-    def remove_by_id(self):
-        idx = self.simple_input("Enter ID to remove:")
-        if idx and idx.isdigit():
-            idx = int(idx) - 1
-            if 0 <= idx < len(self.queue):
-                self.queue.pop(idx)
-                self.refresh_list()
+        # connect selection
+        self.table.itemSelectionChanged.connect(self.on_select_task)
 
-    def retry_by_id(self):
-        idx = self.simple_input("Enter ID to retry:")
-        if idx and idx.isdigit():
-            idx = int(idx) - 1
-            if 0 <= idx < len(self.queue):
-                job = self.queue[idx].copy()
-                job["status"] = "Pending"
-                self.queue.append(job)
-                self.refresh_list()
+    def browse_file(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select .blend file", "", "Blender files (*.blend);;All files (*)")
+        if fn:
+            self.input_path.setText(fn)
 
-    def refresh_list(self):
-        self.file_list.delete(0, tk.END)
-        for i, job in enumerate(self.queue, start=1):
-            base = os.path.basename(job["file"])
-            status = job.get("status", "Pending")
-            if job["meta"]:
-                m = job["meta"]
-                desc = f"{i}. {base} | {m['frame_start']}-{m['frame_end']} step {m['frame_step']} | Nodes {'✅' if m['use_nodes'] else '❌'} | {status}"
-            else:
-                desc = f"{i}. {base} | {status}"
-            self.file_list.insert(tk.END, desc)
+    def submit_task(self):
+        path = self.input_path.text().strip()
+        start = int(self.input_start.value())
+        end = int(self.input_end.value())
+        name = self.input_name.text().strip() or "artist"
+        assigned = self.worker_combo.currentData()  # 'auto' or worker id
+        if not path:
+            QtWidgets.QMessageBox.warning(self, "Validation", "Please select a .blend path.")
+            return
+        # if user selected a specific worker that is offline -> warn
+        if assigned and assigned != "auto":
+            res_w = api_get("/list_workers")
+            if isinstance(res_w, dict) and "workers" in res_w:
+                chosen = None
+                for w in res_w["workers"]:
+                    if w["id"] == assigned:
+                        chosen = w
+                        break
+                if chosen and not chosen.get("on"):
+                    # warn but allow
+                    resp = QtWidgets.QMessageBox.question(self, "Worker offline", f"Worker '{chosen['name']}' is currently OFF. Submit anyway (it will stay queued)?", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+                    if resp != QtWidgets.QMessageBox.Yes:
+                        return
+        res = api_post("/submit_task", {"path": path, "start": start, "end": end, "artist": name, "assigned_worker": assigned})
+        if not res.get("ok"):
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to submit: {res.get('error')}")
+            return
+        tid = res.get("task_id")
+        assigned_worker = res.get("assigned_worker")
+        QtWidgets.QMessageBox.information(self, "Submitted", f"Task submitted (id={tid}). Assigned worker: {assigned_worker}")
+        # clear form optional
+        # self.input_path.clear()
+        self.refresh_all()
 
-    # ==============================
-    # Inspect
-    # ==============================
-    def inspect_selected(self):
-        sel = self.file_list.curselection()
+    def refresh_workers(self):
+        res = api_get("/list_workers")
+        if not isinstance(res, dict) or "workers" not in res:
+            return
+        workers = res["workers"]
+        # update combo
+        current = self.worker_combo.currentData()
+        self.worker_combo.clear()
+        self.worker_combo.addItem("Auto (first ON)", "auto")
+        for w in workers:
+            label = f"{w['name']} ({w['id'][:8]}) {'[ON]' if w.get('on') else '[OFF]'}"
+            self.worker_combo.addItem(label, w["id"])
+        # try to restore selection
+        index = 0
+        for i in range(self.worker_combo.count()):
+            if self.worker_combo.itemData(i) == current:
+                index = i
+                break
+        self.worker_combo.setCurrentIndex(index)
+        # update table
+        self.workers_table.setRowCount(len(workers))
+        for i, w in enumerate(workers):
+            self.workers_table.setItem(i, 0, QtWidgets.QTableWidgetItem(w["id"]))
+            self.workers_table.setItem(i, 1, QtWidgets.QTableWidgetItem(w.get("name","")))
+            self.workers_table.setItem(i, 2, QtWidgets.QTableWidgetItem("ON" if w.get("on") else "OFF"))
+            self.workers_table.setItem(i, 3, QtWidgets.QTableWidgetItem(w.get("last_seen","")))
+
+    def refresh_tasks(self):
+        res = api_get("/tasks")
+        if not isinstance(res, dict) or "tasks" not in res:
+            return
+        tasks = res["tasks"]
+        self.table.setRowCount(len(tasks))
+        for i, t in enumerate(tasks):
+            id_item = QtWidgets.QTableWidgetItem(t["id"])
+            artist_item = QtWidgets.QTableWidgetItem(t.get("artist", ""))
+            frames_item = QtWidgets.QTableWidgetItem(f"{t.get('start')}-{t.get('end')}")
+            worker_item = QtWidgets.QTableWidgetItem(str(t.get("assigned_worker")))
+            status_item = QtWidgets.QTableWidgetItem(t.get("status"))
+            prog = t.get("progress_percent", 0.0) or 0.0
+            eta = format_eta(t.get("eta_seconds"))
+            progress_item = QtWidgets.QTableWidgetItem(f"{prog}%")
+            eta_item = QtWidgets.QTableWidgetItem(eta)
+            self.table.setItem(i, 0, id_item)
+            self.table.setItem(i, 1, artist_item)
+            self.table.setItem(i, 2, frames_item)
+            self.table.setItem(i, 3, worker_item)
+            self.table.setItem(i, 4, status_item)
+            self.table.setItem(i, 5, progress_item)
+            self.table.setItem(i, 6, eta_item)
+
+    def on_select_task(self):
+        sel = self.table.selectedIndexes()
         if not sel:
-            messagebox.showwarning("Warning", "Please select a .blend file!")
+            self.log_view.setPlainText("")
+            self.task_detail_label.setText("")
             return
-        idx = sel[0]
-        job = self.queue[idx]
-        data = inspect_blend(job["file"], self.blender_exec)
-        if data:
-            job["meta"] = data
-            self.start_entry.delete(0, tk.END)
-            self.start_entry.insert(0, data["frame_start"])
-            self.end_entry.delete(0, tk.END)
-            self.end_entry.insert(0, data["frame_end"])
-            self.step_entry.delete(0, tk.END)
-            self.step_entry.insert(0, data["frame_step"])
-            self.use_nodes_var.set(data["use_nodes"])
-            self.meta_text.delete("1.0", tk.END)
-            self.meta_text.insert(tk.END, json.dumps(data, indent=2))
-            self.status_label.config(text=f"Status: Inspected {os.path.basename(job['file'])} ✅")
-            self.refresh_list()
-        else:
-            messagebox.showerror("Error", "Failed to inspect blend file!")
-
-    # ==============================
-    # Render Queue
-    # ==============================
-    def start_queue(self):
-        if self.is_rendering:
-            return
-        if not self.queue:
-            messagebox.showwarning("Warning", "Queue is empty!")
-            return
-        self.is_rendering = True
-        self.status_label.config(text="Status: Rendering...")
-        self.root.after(100, self.render_next)
-
-    def stop_queue(self):
-        self.is_rendering = False
-        self.status_label.config(text="Status: Stopped ❌")
-
-    def render_next(self):
-        if not self.is_rendering:
-            return
-
-        job = None
-        for j in self.queue:
-            if j.get("status") == "Pending":
-                job = j
+        row = sel[0].row()
+        tid_item = self.table.item(row, 0)
+        if not tid_item: return
+        tid = tid_item.text()
+        res = api_get("/tasks")
+        if not res.get("tasks"): return
+        for t in res["tasks"]:
+            if t["id"] == tid:
+                logs = t.get("logs", [])
+                txt = "\n".join(f"[{l['t']}] {l['line']}" for l in logs[-200:])
+                self.log_view.setPlainText(txt)
+                detail = f"Status: {t.get('status')} | Assigned: {t.get('assigned_worker')} | Progress: {t.get('progress_percent')}% | ETA: {format_eta(t.get('eta_seconds'))}"
+                self.task_detail_label.setText(detail)
                 break
 
-        if not job:
-            self.is_rendering = False
-            self.status_label.config(text="Status: Done ✅")
-            self.eta_label.config(text="ETA: Finished")
-            return
+    def refresh_all(self):
+        self.refresh_workers()
+        self.refresh_tasks()
+        # update selected log view if a task selected
+        self.on_select_task()
 
-        job["status"] = "Rendering"
-        self.refresh_list()
+# Worker window (UI)
+class WorkerWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RenderQ - Workers")
+        self.setMinimumSize(760, 520)
+        self.worker_id = str(uuid.uuid4())[:8]
+        self.worker_name = f"worker-{self.worker_id}"
+        self.thread = None
+        self.init_ui()
+        self.start_worker_thread()
 
-        meta = job["meta"] or {
-            "frame_start": int(self.start_entry.get()),
-            "frame_end": int(self.end_entry.get()),
-            "frame_step": int(self.step_entry.get() or 1),
-            "use_nodes": self.use_nodes_var.get()
-        }
+    def init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel(f"Worker Node - {self.worker_name}")
+        header.setObjectName("title")
+        layout.addWidget(header)
 
-        start = int(meta["frame_start"])
-        end = int(meta["frame_end"])
-        step = int(meta["frame_step"])
-        total_frames = ((end - start) // step) + 1
+        info_box = QtWidgets.QGroupBox("Worker Info")
+        i_layout = QtWidgets.QGridLayout()
+        info_box.setLayout(i_layout)
+        i_layout.addWidget(QtWidgets.QLabel("Worker ID:"), 0, 0)
+        self.lbl_id = QtWidgets.QLabel(self.worker_id)
+        i_layout.addWidget(self.lbl_id, 0, 1)
+        i_layout.addWidget(QtWidgets.QLabel("Name:"), 1, 0)
+        self.input_name = QtWidgets.QLineEdit(self.worker_name)
+        i_layout.addWidget(self.input_name, 1, 1)
+        i_layout.addWidget(QtWidgets.QLabel("Available:"), 2, 0)
+        self.toggle = ToggleSwitch("ON", "OFF")
+        self.toggle.setChecked(True)
+        self.toggle.clicked.connect(self.on_toggle)
+        i_layout.addWidget(self.toggle, 2, 1)
+        layout.addWidget(info_box)
 
-        self.progress["maximum"] = total_frames
-        self.progress["value"] = 0
+        # status & logs
+        status_box = QtWidgets.QGroupBox("Status & Logs")
+        s_layout = QtWidgets.QVBoxLayout()
+        status_box.setLayout(s_layout)
+        self.lbl_status = QtWidgets.QLabel("idle")
+        s_layout.addWidget(self.lbl_status)
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        s_layout.addWidget(self.log_view)
+        # progress mini
+        self.progress_label = QtWidgets.QLabel("Progress: -")
+        s_layout.addWidget(self.progress_label)
 
-        job["start_time"] = time.time()
-        job["frames_done"] = 0
-        job["total_frames"] = total_frames
+        layout.addWidget(status_box)
 
-        def update_frame_cb(frame_num):
-            job["frames_done"] += 1
-            self.progress["value"] = job["frames_done"]
-            self.status_label.config(
-                text=f"Rendering {os.path.basename(job['file'])} | Frame {frame_num}/{end}"
-            )
+        footer = QtWidgets.QLabel("Created by Dwiky Gilang Imrodhani | https://github.com/dwikygilang")
+        footer.setObjectName("small")
+        layout.addWidget(footer)
 
-            # ETA per-job
-            elapsed = time.time() - job["start_time"]
-            avg_frame = elapsed / job["frames_done"]
-            eta_job = avg_frame * (total_frames - job["frames_done"])
+    def start_worker_thread(self):
+        self.worker_thread = WorkerThread(self.worker_id, self.worker_name)
+        self.worker_thread.log_signal.connect(self.append_log)
+        self.worker_thread.status_signal.connect(self.update_status)
+        self.worker_thread.progress_signal.connect(self.update_progress)
+        self.worker_thread.start()
 
-            # Total ETA
-            total_remaining_frames = (total_frames - job["frames_done"])
-            for j in self.queue:
-                if j.get("status") == "Pending" and j.get("meta"):
-                    s = j["meta"]["frame_start"]
-                    e = j["meta"]["frame_end"]
-                    st = j["meta"]["frame_step"]
-                    total_remaining_frames += ((e - s) // st + 1)
-            total_eta = avg_frame * total_remaining_frames
+    def append_log(self, text):
+        # ensure UI thread
+        self.log_view.appendPlainText(text)
 
-            self.eta_label.config(
-                text=f"ETA job: {eta_job:.1f}s | Total ETA: {total_eta:.1f}s"
-            )
+    def update_status(self, s):
+        self.lbl_status.setText(s)
 
-        def worker():
-            code = render_job(job["file"], start, end, step, self.blender_exec, update_frame_cb)
-            job["status"] = "Done" if code == 0 else "Failed"
-            self.save_log({
-                "file": job["file"],
-                "status": job["status"],
-                "start": start,
-                "end": end,
-                "step": step,
-                "use_nodes": meta["use_nodes"],
-                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            self.refresh_list()
-            self.root.after(100, self.render_next)
+    def update_progress(self, p: dict):
+        # p: {current_frame, total_frames, percent, eta_seconds}
+        eta_text = format_eta(p.get("eta_seconds"))
+        self.progress_label.setText(f"Progress: {p.get('percent')}% ({p.get('current_frame')}/{p.get('total_frames')}) ETA: {eta_text}")
 
-        threading.Thread(target=worker, daemon=True).start()
+    def on_toggle(self):
+        checked = self.toggle.isChecked()
+        # update worker name if changed
+        newname = self.input_name.text().strip()
+        self.worker_thread.worker_name = newname or self.worker_thread.worker_name
+        self.worker_thread.set_available(checked)
+        api_post("/update_worker", {"id": self.worker_id, "on": checked, "name": newname})
+        self.append_log(f"Availability set to {'ON' if checked else 'OFF'}")
 
-    # ==============================
-    # Helper
-    # ==============================
-    def simple_input(self, prompt):
-        win = tb.Toplevel()
-        win.title("Input")
-        tb.Label(win, text=prompt).pack(padx=10, pady=10)
-        entry = tb.Entry(win)
-        entry.pack(padx=10, pady=5)
-        result = []
-        def submit():
-            result.append(entry.get())
-            win.destroy()
-        tb.Button(win, text="OK", bootstyle=PRIMARY, command=submit).pack(pady=5)
-        win.grab_set()
-        win.wait_window()
-        return result[0] if result else None
+    def closeEvent(self, event):
+        try:
+            self.worker_thread.stop()
+        except:
+            pass
+        event.accept()
 
-    def save_log(self, entry):
-        log_file = "blender_queue.json"
-        logs = []
-        if os.path.exists(log_file):
-            with open(log_file, "r") as f:
-                try:
-                    logs = json.load(f)
-                except:
-                    logs = []
-        logs.append(entry)
-        with open(log_file, "w") as f:
-            json.dump(logs, f, indent=2)
+# Mode chooser
+class ModeChooser(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Render Farm - Mode Selection")
+        self.setFixedSize(460, 260)
+        self.init_ui()
 
-# ==============================
-# Run
-# ==============================
+    def init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel("Render Farm\nChoose Mode")
+        header.setAlignment(QtCore.Qt.AlignCenter)
+        header.setObjectName("title")
+        layout.addWidget(header)
+        layout.addSpacing(10)
+
+        btn_artist = QtWidgets.QPushButton("Artist (submit tasks)")
+        btn_worker = QtWidgets.QPushButton("Worker (render node)")
+
+        btn_artist.clicked.connect(self.open_artist)
+        btn_worker.clicked.connect(self.open_worker)
+
+        layout.addWidget(btn_artist)
+        layout.addWidget(btn_worker)
+        layout.addStretch()
+
+    def open_artist(self):
+        self.aw = ArtistWindow()
+        self.aw.show()
+        self.close()
+
+    def open_worker(self):
+        self.ww = WorkerWindow()
+        self.ww.show()
+        self.close()
+
+# ---- Main entrypoint ----
+def main():
+    # start server thread
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    # small wait for server up
+    time.sleep(0.6)
+
+    app_qt = QtWidgets.QApplication(sys.argv)
+    app_qt.setStyleSheet(DARK_STYLE)
+    chooser = ModeChooser()
+    chooser.show()
+    sys.exit(app_qt.exec())
+
 if __name__ == "__main__":
-    app = TkinterDnD.Tk()
-    BlenderQueueApp(app)
-    app.mainloop()
+    main()
