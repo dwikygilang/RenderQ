@@ -19,7 +19,6 @@ It supports **multiple workers**, **progress tracking**, and **manual/auto worke
 
 ## 📦 Requirements
 Install dependencies with:
-
 ```bash
 pip install Flask PySide6 requests
 ```
@@ -36,10 +35,10 @@ POLL_INTERVAL = 1.0  # GUI polling interval (seconds)
 FRAME_TIME_WINDOW = 8  # number of recent frames for ETA calculation
 # ---------------------------
 ```
-SERVER_HOST → keep 0.0.0.0 so other machines on the network can access it.
-SERVER_URL → change to match your server IP.
-POLL_INTERVAL → refresh interval for GUI.
-FRAME_TIME_WINDOW → determines the frame average for ETA calculation.
+- SERVER_HOST → keep 0.0.0.0 so other machines on the network can access it.
+- SERVER_URL → change to match your server IP.
+- POLL_INTERVAL → refresh interval for GUI.
+- FRAME_TIME_WINDOW → determines the frame average for ETA calculation.
 
 ## 🚀 How to Run
 1. Start the app
@@ -47,20 +46,20 @@ FRAME_TIME_WINDOW → determines the frame average for ETA calculation.
    python main.py
    ```
 ### 🖥️ GUI Overview
-Artist Window → Submit & monitor tasks
-Worker Window → View worker status and render logs
+- Artist Window → Submit & monitor tasks
+- Worker Window → View worker status and render logs
 
 ## 🔗 API Endpoints
-The server also provides a simple REST API:
-POST /register_worker – register a new worker
-POST /update_worker – update worker status
-GET /list_workers – list all workers
-POST /submit_task – submit a render task
-GET /get_task – worker fetches task
-POST /update_task – update task status & progress
-GET /tasks – list all tasks
+- The server also provides a simple REST API:
+- POST /register_worker – register a new worker
+- POST /update_worker – update worker status
+- GET /list_workers – list all workers
+- POST /submit_task – submit a render task
+- GET /get_task – worker fetches task
+- POST /update_task – update task status & progress
+- GET /tasks – list all tasks
 
 ## 📌 Notes
-A worker is considered alive if its last update < 15 seconds.
-Tasks can be auto-assigned (first ON worker) or manually assigned to a worker.
-ETA is calculated based on the average duration of recent frames × remaining frames.
+- A worker is considered alive if its last update < 15 seconds.
+- Tasks can be auto-assigned (first ON worker) or manually assigned to a worker.
+- ETA is calculated based on the average duration of recent frames × remaining frames.
