@@ -2,12 +2,12 @@ import os
 import subprocess
 import json
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, scrolledtext
 
 # ==============================
-# Blender Inspector
+# Inspect .blend
 # ==============================
-def inspect_blend(blend_file):
+def inspect_blend(blend_file, blender_exec="blender"):
     code = """
 import bpy, json
 scene = bpy.context.scene
@@ -18,19 +18,43 @@ data = {
     "output_path": scene.render.filepath,
     "use_nodes": scene.use_nodes
 }
+print("BLEND_META_START")
 print(json.dumps(data))
+print("BLEND_META_END")
 """
     try:
         result = subprocess.run(
-            ["blender", "-b", blend_file, "--python-expr", code],
+            [blender_exec, "-b", blend_file, "--python-expr", code],
             capture_output=True, text=True
         )
+        inside = False
+        json_str = ""
         for line in result.stdout.splitlines():
-            if line.startswith("{") and line.endswith("}"):
-                return json.loads(line)
+            if "BLEND_META_START" in line:
+                inside = True
+                continue
+            if "BLEND_META_END" in line:
+                break
+            if inside:
+                json_str += line.strip()
+        if json_str:
+            return json.loads(json_str)
     except Exception as e:
         print("Inspect error:", e)
     return None
+
+# ==============================
+# Render job
+# ==============================
+def render_job(blend_file, start, end, blender_exec="blender"):
+    cmd = [
+        blender_exec, "-b", blend_file,
+        "-s", str(start),
+        "-e", str(end),
+        "-a"
+    ]
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd)
 
 # ==============================
 # Main App
@@ -39,27 +63,27 @@ class BlenderQueueApp:
     def __init__(self, root):
         self.root = root
         self.root.title("🎬 Blender Render Queue Manager")
-        self.root.geometry("850x600")
+        self.root.geometry("880x620")
         self.root.configure(bg="#2b2b2b")
 
         self.queue = []
-        self.selected_blend = None
         self.is_rendering = False
+        self.blender_exec = "blender"
 
         self.setup_ui()
 
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TButton", background="#444", foreground="white", padding=6)
+        style.configure("TButton", background="#444", foreground="white", padding=6, relief="flat")
         style.map("TButton", background=[("active", "#666")])
         style.configure("TLabel", background="#2b2b2b", foreground="white")
 
-        # Frame atas (file list + tombol)
-        frame_top = tk.Frame(self.root, bg="#2b2b2b")
+        # Queue list
+        frame_top = tk.LabelFrame(self.root, text="Render Queue", bg="#2b2b2b", fg="white")
         frame_top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.file_list = tk.Listbox(frame_top, bg="#1e1e1e", fg="white", selectbackground="#444", height=12)
+        self.file_list = tk.Listbox(frame_top, bg="#1e1e1e", fg="white", selectbackground="#444", height=10)
         self.file_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
         scrollbar = tk.Scrollbar(frame_top)
@@ -67,6 +91,7 @@ class BlenderQueueApp:
         self.file_list.config(yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.file_list.yview)
 
+        # Buttons
         frame_btn = tk.Frame(self.root, bg="#2b2b2b")
         frame_btn.pack(pady=5)
         ttk.Button(frame_btn, text="➕ Add Blend", command=self.add_blend).pack(side=tk.LEFT, padx=5)
@@ -78,25 +103,24 @@ class BlenderQueueApp:
         frame_settings = tk.LabelFrame(self.root, text="Render Settings", bg="#2b2b2b", fg="white")
         frame_settings.pack(fill=tk.X, padx=10, pady=10)
 
-        tk.Label(frame_settings, text="Output Folder:", bg="#2b2b2b", fg="white").grid(row=0, column=0, sticky="e")
-        self.output_entry = tk.Entry(frame_settings, width=50)
-        self.output_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        tk.Label(frame_settings, text="Start Frame:", bg="#2b2b2b", fg="white").grid(row=1, column=0, sticky="e")
+        tk.Label(frame_settings, text="Start Frame:", bg="#2b2b2b", fg="white").grid(row=0, column=0, sticky="e")
         self.start_entry = tk.Entry(frame_settings, width=10)
-        self.start_entry.grid(row=1, column=1, sticky="w", padx=5)
+        self.start_entry.grid(row=0, column=1, sticky="w", padx=5)
 
-        tk.Label(frame_settings, text="End Frame:", bg="#2b2b2b", fg="white").grid(row=1, column=1, sticky="e", padx=(100, 0))
+        tk.Label(frame_settings, text="End Frame:", bg="#2b2b2b", fg="white").grid(row=0, column=2, sticky="e")
         self.end_entry = tk.Entry(frame_settings, width=10)
-        self.end_entry.grid(row=1, column=1, sticky="e", padx=(0, 5))
-
-        tk.Label(frame_settings, text="Step:", bg="#2b2b2b", fg="white").grid(row=1, column=2, sticky="e")
-        self.step_entry = tk.Entry(frame_settings, width=10)
-        self.step_entry.grid(row=1, column=3, sticky="w", padx=5)
+        self.end_entry.grid(row=0, column=3, sticky="w", padx=5)
 
         self.use_nodes_var = tk.BooleanVar()
-        self.use_nodes_check = tk.Checkbutton(frame_settings, text="Use Nodes", variable=self.use_nodes_var, bg="#2b2b2b", fg="white", selectcolor="#444")
-        self.use_nodes_check.grid(row=2, column=1, sticky="w")
+        self.use_nodes_check = tk.Checkbutton(frame_settings, text="Use Nodes", variable=self.use_nodes_var,
+                                              bg="#2b2b2b", fg="white", selectcolor="#444")
+        self.use_nodes_check.grid(row=0, column=4, padx=10)
+
+        # Inspect Output
+        frame_meta = tk.LabelFrame(self.root, text="Inspect Output & Metadata", bg="#2b2b2b", fg="white")
+        frame_meta.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.meta_text = scrolledtext.ScrolledText(frame_meta, bg="#1e1e1e", fg="lightgreen", height=8)
+        self.meta_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Render Controls
         frame_ctrl = tk.Frame(self.root, bg="#2b2b2b")
@@ -109,7 +133,8 @@ class BlenderQueueApp:
         self.status_label.pack(fill=tk.X, padx=10, pady=5)
 
         # Footer
-        footer = tk.Label(self.root, text="Made by Dwiky & ChatGPT  |  https://github.com/dwikygilang",
+        footer = tk.Label(self.root,
+                          text="Made by Dwiky & ChatGPT  |  https://github.com/dwikygilang",
                           bg="#2b2b2b", fg="gray", anchor="w")
         footer.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
 
@@ -120,10 +145,10 @@ class BlenderQueueApp:
         file = filedialog.askopenfilename(filetypes=[("Blender Files", "*.blend")])
         if file:
             self.queue.append(file)
-            self.file_list.insert(tk.END, f"{len(self.queue)}. {os.path.basename(file)}")
+            self.refresh_list()
 
     def remove_by_id(self):
-        idx = simple_input("Enter ID to remove:")
+        idx = self.simple_input("Enter ID to remove:")
         if idx and idx.isdigit():
             idx = int(idx) - 1
             if 0 <= idx < len(self.queue):
@@ -131,7 +156,7 @@ class BlenderQueueApp:
                 self.refresh_list()
 
     def retry_by_id(self):
-        idx = simple_input("Enter ID to retry:")
+        idx = self.simple_input("Enter ID to retry:")
         if idx and idx.isdigit():
             idx = int(idx) - 1
             if 0 <= idx < len(self.queue):
@@ -154,17 +179,17 @@ class BlenderQueueApp:
             return
         idx = sel[0]
         blend_file = self.queue[idx]
-        data = inspect_blend(blend_file)
+        data = inspect_blend(blend_file, self.blender_exec)
         if data:
-            self.output_entry.delete(0, tk.END)
-            self.output_entry.insert(0, data["output_path"])
+            # update fields
             self.start_entry.delete(0, tk.END)
             self.start_entry.insert(0, data["frame_start"])
             self.end_entry.delete(0, tk.END)
             self.end_entry.insert(0, data["frame_end"])
-            self.step_entry.delete(0, tk.END)
-            self.step_entry.insert(0, data["frame_step"])
             self.use_nodes_var.set(data["use_nodes"])
+            # update metadata panel
+            self.meta_text.delete("1.0", tk.END)
+            self.meta_text.insert(tk.END, json.dumps(data, indent=2))
             self.status_label.config(text=f"Status: Inspected {os.path.basename(blend_file)} ✅")
         else:
             messagebox.showerror("Error", "Failed to inspect blend file!")
@@ -195,39 +220,31 @@ class BlenderQueueApp:
         blend_file = self.queue.pop(0)
         self.refresh_list()
 
-        # Ambil setting dari GUI
-        output_path = self.output_entry.get()
+        # ambil frame range dari GUI
         start = self.start_entry.get()
         end = self.end_entry.get()
-        step = self.step_entry.get()
 
-        cmd = [
-            "blender", "-b", blend_file,
-            "-o", output_path,
-            "-s", start, "-e", end, "-j", step,
-            "-a"
-        ]
-        subprocess.run(cmd)
+        render_job(blend_file, start, end, self.blender_exec)
 
         self.root.after(1000, self.render_next)
 
-# ==============================
-# Helper Input Dialog
-# ==============================
-def simple_input(prompt):
-    win = tk.Toplevel()
-    win.title("Input")
-    tk.Label(win, text=prompt).pack(padx=10, pady=10)
-    entry = tk.Entry(win)
-    entry.pack(padx=10, pady=5)
-    result = []
-    def submit():
-        result.append(entry.get())
-        win.destroy()
-    tk.Button(win, text="OK", command=submit).pack(pady=5)
-    win.grab_set()
-    win.wait_window()
-    return result[0] if result else None
+    # ==============================
+    # Helper
+    # ==============================
+    def simple_input(self, prompt):
+        win = tk.Toplevel()
+        win.title("Input")
+        tk.Label(win, text=prompt, bg="#2b2b2b", fg="white").pack(padx=10, pady=10)
+        entry = tk.Entry(win)
+        entry.pack(padx=10, pady=5)
+        result = []
+        def submit():
+            result.append(entry.get())
+            win.destroy()
+        tk.Button(win, text="OK", command=submit).pack(pady=5)
+        win.grab_set()
+        win.wait_window()
+        return result[0] if result else None
 
 # ==============================
 # Run
