@@ -1,9 +1,4 @@
 """
-render_farm_gui_with_eta.py
-Server + Client GUI (Artist & Worker) dengan:
-- parsing progress & ETA dari log blender
-- UI multiple workers + pilih worker manual saat submit
-
 Requirements:
 pip install Flask PySide6 requests
 """
@@ -22,7 +17,7 @@ from functools import partial
 # --------- CONFIG ----------
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5000
-SERVER_URL = f"http://127.0.0.1:{SERVER_PORT}"  # jika ingin jaringan, ganti ke IP server
+SERVER_URL = f"http://192.168.1.47:{SERVER_PORT}"  # jika ingin jaringan, ganti ke IP server
 POLL_INTERVAL = 1.0  # detik polling GUI
 FRAME_TIME_WINDOW = 8  # number of recent frames to average
 # ---------------------------
@@ -73,7 +68,17 @@ def update_worker():
 @app.route("/list_workers", methods=["GET"])
 def list_workers():
     with LOCK:
-        return jsonify({"workers": list(WORKERS.values())})
+        now = datetime.utcnow()
+        alive_workers = []
+        for wid, w in list(WORKERS.items()):
+            last_seen = datetime.fromisoformat(w["last_seen"].replace("Z", ""))
+            w["alive"] = (now - last_seen).total_seconds() <= 15  # perpanjang timeout jadi 15 detik
+            alive_workers.append(w)
+        return jsonify({"workers": alive_workers})
+
+def is_worker_alive(worker, timeout=5):
+    last_seen = datetime.fromisoformat(worker["last_seen"].replace("Z", ""))
+    return (datetime.utcnow() - last_seen).total_seconds() <= timeout
 
 @app.route("/submit_task", methods=["POST"])
 def submit_task():
